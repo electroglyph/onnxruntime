@@ -1,8 +1,10 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-#include <vector>
+#include <algorithm>
+#include <cstring>
 #include <unordered_map>
+#include <vector>
 
 #include "core/common/common.h"
 #include "core/common/narrow.h"
@@ -10,6 +12,7 @@
 #include "core/common/float16.h"
 #include "core/framework/int4.h"
 #include "core/framework/op_kernel.h"
+#include "core/mlas/lib/mlasi.h"
 #include "core/platform/threadpool.h"
 #include "core/providers/common.h"
 
@@ -100,6 +103,53 @@ class GatherBlockQuantized : public OpKernel {
                                const int64_t quantize_axis_dim,
                                const int64_t quantize_N,
                                concurrency::ThreadPool* tp) const;
+
+  // Dequantize the element at data_idx (scale block scale_idx) into
+  // output_ptr[output_idx]. Shared by the generic loop and the embedding
+  // fast path so both produce bit-identical outputs. scale_row_len is the
+  // number of scale blocks per row (scale_full_block in the generic path,
+  // num_blocks in the fast path).
+  template <typename T2>
+  void DequantizeElement(const T1* data_ptr,
+                         const T2* scales_ptr,
+                         const T1* zero_points_ptr,
+                         T2* output_ptr,
+                         int64_t data_idx,
+                         int64_t scale_idx,
+                         int64_t scale_row_len,
+                         int64_t output_idx) const;
+
+  // Embedding fast path for rank 2 with gather_axis == 0 and
+  // quantize_axis == last dim: simplified block indexing with the block
+  // index as loop counter, indices validated once up front. Rows go through
+  // MLAS dispatch (scalar/SIMD selected at runtime); other shapes use the
+  // scalar loop.
+  template <typename T2>
+  Status CopyDataAndDequantizeFastPath(const T1* data_ptr,
+                                       const Tind* indices_ptr,
+                                       const T2* scales_ptr,
+                                       const T1* zero_points_ptr,
+                                       T2* output_ptr,
+                                       int64_t gather_axis_dim,
+                                       int64_t gather_block,
+                                       int64_t gather_N,
+                                       concurrency::ThreadPool* tp) const;
+
+  // One fast-path row through MLAS dispatch (scalar/AVX2/AVX512 selected at
+  // runtime). Rows are packed-unit aligned (caller guarantees even K for
+  // 4-bit, K % 4 == 0 for 2-bit; 8-bit rows are always byte aligned); the
+  // caller uses the scalar loop otherwise. scales_scratch converts one row
+  // of scales for T2 != float and is reused across rows by the caller.
+  template <typename T2>
+  void DequantizeRowMlas(const T1* data_ptr,
+                         const T2* scales_ptr,
+                         const T1* zero_points_ptr,
+                         T2* output_ptr,
+                         int64_t row,
+                         int64_t n,
+                         int64_t gather_block,
+                         int64_t num_blocks,
+                         std::vector<float>& scales_scratch) const;
 
  private:
   int64_t gather_axis_;
@@ -192,6 +242,74 @@ Status GatherBlockQuantized<T1, Tind>::PrepareForCompute(OpKernelContext* contex
 
 template <typename T1, typename Tind>
 template <typename T2>
+void GatherBlockQuantized<T1, Tind>::DequantizeElement(const T1* data_ptr,
+                                                       const T2* scales_ptr,
+                                                       const T1* zero_points_ptr,
+                                                       T2* output_ptr,
+                                                       int64_t data_idx,
+                                                       int64_t scale_idx,
+                                                       int64_t scale_row_len,
+                                                       int64_t output_idx) const {
+  int32_t data_val;
+  if constexpr (!std::is_same_v<T1, uint8_t>) {
+    data_val = Get4BitElement(data_ptr, data_idx);
+  } else {  // uint8_t
+    if (bits_ == 2) {
+      data_val = Get2BitElementUint8(data_ptr, data_idx);
+    } else if (bits_ == 4) {
+      data_val = Get4BitElement(data_ptr, data_idx);
+    } else {  // bits_ == 8
+      data_val = static_cast<int32_t>(data_ptr[data_idx]);
+    }
+  }
+
+  auto scale_val = static_cast<float>(scales_ptr[scale_idx]);
+  int32_t zp_val;
+
+  if constexpr (std::is_same_v<T1, uint8_t>) {
+    if (zero_points_ptr) {
+      // For uint8 we enforce quantize_axis == last dim, which makes quantize_N == 1
+      // and scale_full_block == scale_qaxis_dim. Zero points are packed only along
+      // the quantize axis, so the packed byte must be addressed using the scale row
+      // index and the within-row quantize-axis index, not the flat scale_idx; the
+      // latter crosses row boundaries when scale_qaxis_dim is not a multiple of the
+      // packing factor.
+      const int64_t scale_qaxis_dim = scale_row_len;
+      const int64_t scale_row = scale_idx / scale_qaxis_dim;
+      const int64_t q_in_row = scale_idx % scale_qaxis_dim;
+      if (bits_ == 2) {
+        const int64_t packed_zp_qaxis_dim = (scale_qaxis_dim + 3) / 4;
+        const int64_t byte_idx = scale_row * packed_zp_qaxis_dim + (q_in_row >> 2);
+        const int shift = static_cast<int>((q_in_row & 3) * 2);
+        zp_val = static_cast<int32_t>((zero_points_ptr[byte_idx] >> shift) & 0x03);
+      } else if (bits_ == 4) {
+        const int64_t packed_zp_qaxis_dim = (scale_qaxis_dim + 1) / 2;
+        const int64_t byte_idx = scale_row * packed_zp_qaxis_dim + (q_in_row >> 1);
+        uint8_t packed = zero_points_ptr[byte_idx];
+        if (q_in_row & 1) {
+          zp_val = static_cast<int32_t>((packed >> 4) & 0x0F);
+        } else {
+          zp_val = static_cast<int32_t>(packed & 0x0F);
+        }
+      } else {  // bits_ == 8
+        zp_val = static_cast<int32_t>(zero_points_ptr[scale_idx]);
+      }
+    } else {
+      // Default zero point is 2^(bits-1): 2 for 2-bit, 8 for 4-bit, 128 for 8-bit.
+      const int32_t default_zero_point = 1 << (static_cast<int>(bits_) - 1);
+      zp_val = default_zero_point;
+    }
+  } else {
+    zp_val = zero_points_ptr
+                 ? static_cast<int32_t>(zero_points_ptr[scale_idx >> 1].GetElem(narrow<size_t>(scale_idx & 1)))
+                 : 0;
+  }
+
+  output_ptr[output_idx] = static_cast<T2>(static_cast<float>(data_val - zp_val) * scale_val);
+}
+
+template <typename T1, typename Tind>
+template <typename T2>
 Status GatherBlockQuantized<T1, Tind>::CopyDataAndDequantize(const T1* data_ptr,
                                                              const Tind* indices_ptr,
                                                              const T2* scales_ptr,
@@ -231,66 +349,12 @@ Status GatherBlockQuantized<T1, Tind>::CopyDataAndDequantize(const T1* data_ptr,
     int64_t output_idx = output_idx_base;
     int64_t data_idx = data_idx_base;
     for (int64_t i = 0; i < gather_block; ++i, ++output_idx, ++data_idx) {
-      int32_t data_val;
-      if constexpr (!std::is_same_v<T1, uint8_t>) {
-        data_val = Get4BitElement(data_ptr, data_idx);
-      } else {  // uint8_t
-        if (bits_ == 2) {
-          data_val = Get2BitElementUint8(data_ptr, data_idx);
-        } else if (bits_ == 4) {
-          data_val = Get4BitElement(data_ptr, data_idx);
-        } else {  // bits_ == 8
-          data_val = static_cast<int32_t>(data_ptr[data_idx]);
-        }
-      }
-
       int64_t x = data_idx / quantize_full_block;
       int64_t y = data_idx % quantize_full_block / quantize_N;
       int64_t z = data_idx % quantize_N;
       int64_t scale_idx = x * scale_full_block + y / block_size_ * quantize_N + z;
-      auto scale_val = static_cast<float>(scales_ptr[scale_idx]);
-      int32_t zp_val;
-
-      if constexpr (std::is_same_v<T1, uint8_t>) {
-        if (zero_points_ptr) {
-          // For uint8 we enforce quantize_axis == last dim, which makes quantize_N == 1
-          // and scale_full_block == scale_qaxis_dim. Zero points are packed only along
-          // the quantize axis, so the packed byte must be addressed using the scale row
-          // index and the within-row quantize-axis index, not the flat scale_idx; the
-          // latter crosses row boundaries when scale_qaxis_dim is not a multiple of the
-          // packing factor.
-          const int64_t scale_qaxis_dim = scale_full_block;
-          const int64_t scale_row = scale_idx / scale_qaxis_dim;
-          const int64_t q_in_row = scale_idx % scale_qaxis_dim;
-          if (bits_ == 2) {
-            const int64_t packed_zp_qaxis_dim = (scale_qaxis_dim + 3) / 4;
-            const int64_t byte_idx = scale_row * packed_zp_qaxis_dim + (q_in_row >> 2);
-            const int shift = static_cast<int>((q_in_row & 3) * 2);
-            zp_val = static_cast<int32_t>((zero_points_ptr[byte_idx] >> shift) & 0x03);
-          } else if (bits_ == 4) {
-            const int64_t packed_zp_qaxis_dim = (scale_qaxis_dim + 1) / 2;
-            const int64_t byte_idx = scale_row * packed_zp_qaxis_dim + (q_in_row >> 1);
-            uint8_t packed = zero_points_ptr[byte_idx];
-            if (q_in_row & 1) {
-              zp_val = static_cast<int32_t>((packed >> 4) & 0x0F);
-            } else {
-              zp_val = static_cast<int32_t>(packed & 0x0F);
-            }
-          } else {  // bits_ == 8
-            zp_val = static_cast<int32_t>(zero_points_ptr[scale_idx]);
-          }
-        } else {
-          // Default zero point is 2^(bits-1): 2 for 2-bit, 8 for 4-bit, 128 for 8-bit.
-          const int32_t default_zero_point = 1 << (static_cast<int>(bits_) - 1);
-          zp_val = default_zero_point;
-        }
-      } else {
-        zp_val = zero_points_ptr
-                     ? static_cast<int32_t>(zero_points_ptr[scale_idx >> 1].GetElem(narrow<size_t>(scale_idx & 1)))
-                     : 0;
-      }
-
-      output_ptr[output_idx] = static_cast<T2>(static_cast<float>(data_val - zp_val) * scale_val);
+      DequantizeElement(data_ptr, scales_ptr, zero_points_ptr, output_ptr,
+                        data_idx, scale_idx, scale_full_block, output_idx);
     }
 
     cache[data_idx_base] = output_idx_base;
@@ -309,6 +373,158 @@ Status GatherBlockQuantized<T1, Tind>::CopyDataAndDequantize(const T1* data_ptr,
              index < end;
              ++index) {
           lambda(index, cache);
+        }
+      });
+
+  return Status::OK();
+}
+
+template <typename T1, typename Tind>
+template <typename T2>
+void GatherBlockQuantized<T1, Tind>::DequantizeRowMlas(const T1* data_ptr,
+                                                       const T2* scales_ptr,
+                                                       const T1* zero_points_ptr,
+                                                       T2* output_ptr,
+                                                       int64_t row,
+                                                       int64_t n,
+                                                       int64_t gather_block,
+                                                       int64_t num_blocks,
+                                                       std::vector<float>& scales_scratch) const {
+  // Rows are packed-unit aligned (caller guarantees even K for 4-bit,
+  // K % 4 == 0 for 2-bit; 8-bit rows are always byte aligned). Non-uint8
+  // packings (Int4x2/UInt4x2) are 4-bit only, so bits_ == 4 covers them.
+  const size_t row_bytes = bits_ == 8 ? static_cast<size_t>(gather_block)
+                                      : (static_cast<size_t>(gather_block) >> (bits_ == 4 ? 1 : 2));
+  const uint8_t* packed_row =
+      reinterpret_cast<const uint8_t*>(data_ptr) + static_cast<size_t>(row) * row_bytes;
+  const uint8_t* packed_zp = nullptr;
+  size_t zp_base = 0;
+  if (zero_points_ptr != nullptr) {
+    if constexpr (std::is_same_v<T1, uint8_t>) {
+      // uint8 zero points are packed per row: nibble-packed for 4-bit,
+      // quad-packed for 2-bit, one byte per block for 8-bit.
+      const size_t zp_row_len = bits_ == 8 ? static_cast<size_t>(num_blocks)
+                                : bits_ == 4 ? static_cast<size_t>((num_blocks + 1) / 2)
+                                             : static_cast<size_t>((num_blocks + 3) / 4);
+      packed_zp = reinterpret_cast<const uint8_t*>(zero_points_ptr) +
+                  static_cast<size_t>(row) * zp_row_len;
+    } else {
+      packed_zp = reinterpret_cast<const uint8_t*>(zero_points_ptr);
+      zp_base = static_cast<size_t>(row * num_blocks);
+    }
+  }
+  const size_t k = static_cast<size_t>(gather_block);
+  const size_t block_size = static_cast<size_t>(block_size_);
+  MLAS_PLATFORM& platform = GetMlasPlatform();
+  if constexpr (std::is_same_v<T2, float>) {
+    float* out_row = output_ptr + n * gather_block;
+    const float* scales_row = scales_ptr + row * num_blocks;
+    if constexpr (std::is_same_v<T1, Int4x2>) {
+      platform.GatherBlockDequantizeSymKernel(out_row, packed_row, scales_row, packed_zp, zp_base, k,
+                                              block_size);
+    } else {
+      // uint8 with no zp tensor defaults to 1 << (bits - 1); packed UInt4x2
+      // with no zp tensor uses the kernel zero point 0.
+      const int32_t default_zp = std::is_same_v<T1, uint8_t> ? (1 << (static_cast<int>(bits_) - 1)) : 0;
+      platform.GatherBlockDequantizeAsymKernel(out_row, packed_row, scales_row, packed_zp, zp_base,
+                                               default_zp, static_cast<size_t>(bits_), k, block_size);
+    }
+    return;
+  }
+  // T2 == MLFloat16: MLAS computes in float with fp16 stores; convert the
+  // row's scales once into caller-provided scratch.
+  scales_scratch.resize(static_cast<size_t>(num_blocks));
+  for (int64_t b = 0; b < num_blocks; ++b) {
+    scales_scratch[static_cast<size_t>(b)] = static_cast<float>(scales_ptr[row * num_blocks + b]);
+  }
+  uint16_t* out_row = reinterpret_cast<uint16_t*>(output_ptr + n * gather_block);
+  if constexpr (std::is_same_v<T1, Int4x2>) {
+    platform.GatherBlockDequantizeSymFp16Kernel(out_row, packed_row, scales_scratch.data(), packed_zp,
+                                                zp_base, k, block_size);
+  } else {
+    const int32_t default_zp = std::is_same_v<T1, uint8_t> ? (1 << (static_cast<int>(bits_) - 1)) : 0;
+    platform.GatherBlockDequantizeAsymFp16Kernel(out_row, packed_row, scales_scratch.data(), packed_zp,
+                                                 zp_base, default_zp, static_cast<size_t>(bits_), k,
+                                                 block_size);
+  }
+}
+
+template <typename T1, typename Tind>
+template <typename T2>
+Status GatherBlockQuantized<T1, Tind>::CopyDataAndDequantizeFastPath(const T1* data_ptr,
+                                                                     const Tind* indices_ptr,
+                                                                     const T2* scales_ptr,
+                                                                     const T1* zero_points_ptr,
+                                                                     T2* output_ptr,
+                                                                     const int64_t gather_axis_dim,
+                                                                     const int64_t gather_block,
+                                                                     const int64_t gather_N,
+                                                                     concurrency::ThreadPool* tp) const {
+  // Embedding case: rank == 2, gather_axis == 0, quantize_axis == last dim, so
+  // gather_M == 1 and quantize_N == 1. Row n looks up data row indices[n]:
+  // data_idx = row * gather_block + j, scale_idx = row * num_blocks + j / block_size.
+  const int64_t num_blocks = (gather_block + block_size_ - 1) / block_size_;
+  // MLAS handles 8-bit rows at any K, 4-bit rows with even K, and 2-bit
+  // rows with K a multiple of 4 (packed-unit alignment); other shapes use
+  // the scalar loop below.
+  const bool use_mlas =
+      (bits_ == 8) || (((gather_block & 1) == 0) && (bits_ == 4 || ((gather_block & 3) == 0)));
+
+  // Validate every index once up front; the generic path checks per lookup.
+  for (int64_t n = 0; n < gather_N; ++n) {
+    const int64_t indices_val = static_cast<int64_t>(indices_ptr[n]);
+    ORT_ENFORCE(indices_val >= -gather_axis_dim && indices_val < gather_axis_dim,
+                "indices element out of data bounds, idx=", indices_val,
+                " must be within the inclusive range [", -gather_axis_dim, ",", gather_axis_dim - 1, "]");
+  }
+
+  auto lambda = [&](int64_t n, std::unordered_map<int64_t, int64_t>& cache,
+                    std::vector<float>& scales_scratch) {
+    int64_t row = static_cast<int64_t>(indices_ptr[n]);
+    row = row < 0 ? row + gather_axis_dim : row;
+    const int64_t output_row_base = n * gather_block;
+    const int64_t data_row_base = row * gather_block;
+
+    if (auto it = cache.find(data_row_base); it != cache.end()) {
+      int64_t output_src_idx = it->second;
+      memcpy(output_ptr + output_row_base, output_ptr + output_src_idx, narrow<size_t>(gather_block * sizeof(T2)));
+      return;
+    }
+
+    if (use_mlas) {
+      DequantizeRowMlas(data_ptr, scales_ptr, zero_points_ptr, output_ptr, row, n, gather_block,
+                        num_blocks, scales_scratch);
+      cache[data_row_base] = output_row_base;
+      return;
+    }
+
+    for (int64_t b = 0; b < num_blocks; ++b) {
+      const int64_t scale_idx = row * num_blocks + b;
+      const int64_t j_end = std::min((b + 1) * block_size_, gather_block);
+      for (int64_t j = b * block_size_; j < j_end; ++j) {
+        DequantizeElement(data_ptr, scales_ptr, zero_points_ptr, output_ptr,
+                          data_row_base + j, scale_idx, num_blocks, output_row_base + j);
+      }
+    }
+
+    cache[data_row_base] = output_row_base;
+  };
+
+  concurrency::ThreadPool::TryParallelFor(
+      tp,
+      SafeInt<ptrdiff_t>(gather_N),
+      static_cast<double>(gather_block * 3),
+      [&lambda](ptrdiff_t first, ptrdiff_t last) {
+        // cache dequantized gather_block. Key is data_idx_base. Value is the output_idx_base.
+        // cache is per thread to avoid contention.
+        std::unordered_map<int64_t, int64_t> cache;
+        // Scratch for one row of float scales (fp16 path only), reused per row.
+        std::vector<float> scales_scratch;
+
+        for (auto index = static_cast<int64_t>(first), end = static_cast<int64_t>(last);
+             index < end;
+             ++index) {
+          lambda(index, cache, scales_scratch);
         }
       });
 
@@ -352,27 +568,41 @@ Status GatherBlockQuantized<T1, Tind>::Compute(OpKernelContext* context) const {
   const auto* zero_points_ptr = p.zero_points_tensor ? p.zero_points_tensor->template Data<T1>() : nullptr;
   const auto dequantized_type = p.scales_tensor->GetElementType();
 
+  // Embedding fast path on normalized axes: rank-2 data gathered on axis 0
+  // with per-row blocks on the last dim.
+  const int64_t data_rank = narrow<int64_t>(data_shape.NumDimensions());
+  const bool use_fast_path = (data_rank == 2 && p.gather_axis == 0 && p.quantize_axis == data_rank - 1);
+
   if (dequantized_type == ONNX_NAMESPACE::TensorProto::FLOAT) {
     const auto* scales_ptr = p.scales_tensor->template Data<float>();
     auto* output_ptr = p.output_tensor->template MutableData<float>();
 
+    if (use_fast_path) {
+      return CopyDataAndDequantizeFastPath<float>(data_ptr, indices_ptr, scales_ptr, zero_points_ptr,
+                                                  output_ptr, gather_axis_dim, gather_block, gather_N, tp);
+    }
     return CopyDataAndDequantize<float>(data_ptr, indices_ptr, scales_ptr, zero_points_ptr,
                                         output_ptr, gather_M, gather_N, gather_axis_dim, gather_block,
                                         quantize_axis_dim, quantize_N,
                                         tp);
-  } else if (dequantized_type == ONNX_NAMESPACE::TensorProto::FLOAT16) {
+  }
+  if (dequantized_type == ONNX_NAMESPACE::TensorProto::FLOAT16) {
     const auto* scales_ptr = p.scales_tensor->template Data<MLFloat16>();
     auto* output_ptr = p.output_tensor->template MutableData<MLFloat16>();
 
+    if (use_fast_path) {
+      return CopyDataAndDequantizeFastPath<MLFloat16>(data_ptr, indices_ptr, scales_ptr, zero_points_ptr,
+                                                      output_ptr, gather_axis_dim, gather_block, gather_N, tp);
+    }
     return CopyDataAndDequantize<MLFloat16>(data_ptr, indices_ptr, scales_ptr, zero_points_ptr,
                                             output_ptr, gather_M, gather_N, gather_axis_dim, gather_block,
                                             quantize_axis_dim, quantize_N,
                                             tp);
-  } else if (dequantized_type == ONNX_NAMESPACE::TensorProto::BFLOAT16) {
-    ORT_THROW("DequantizeLinear into BFLOAT16 is not implemented yet.");
-  } else {
-    ORT_THROW("Unsupported dequantized type: ", dequantized_type);
   }
+  if (dequantized_type == ONNX_NAMESPACE::TensorProto::BFLOAT16) {
+    ORT_THROW("DequantizeLinear into BFLOAT16 is not implemented yet.");
+  }
+  ORT_THROW("Unsupported dequantized type: ", dequantized_type);
 }
 
 #define REGISTER_GATHERBLOCKQUANTIZED(T1, Tind)                                                                   \

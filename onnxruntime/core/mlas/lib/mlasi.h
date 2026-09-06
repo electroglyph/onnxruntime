@@ -866,6 +866,70 @@ void
     float Scale,
     float ZeroPointAdjust);
 
+//
+// Gather+block-dequantize fast path: dequantize one-trailing-dim row slice
+// of K quantized elements in blocks of BlockSize. Sym entries are 4-bit
+// only (Int4x2): PackedRow holds K/2 bytes with the even element in the low
+// nibble, and PackedZeroPoints (nullable) holds one nibble per block. Asym
+// entries take QuantBits (2, 4, or 8 for uint8; 4 for packed UInt4x2):
+// PackedRow holds ceil(K*QuantBits/8) bytes with element 0 of each byte in
+// the low bits, and PackedZeroPoints (nullable) holds one QuantBits-wide
+// value per block (nibble-packed for 2/4-bit, one byte per block for 8-bit)
+// starting at element ZeroPointBase. Scales holds ceil(K/BlockSize) scales
+// for the row. When PackedZeroPoints is null, DefaultZeroPoint is used (0
+// for Sym; caller-picked for Asym: 1 << (QuantBits-1) for uint8, 0 for
+// packed UInt4x2). K must keep rows packed-unit aligned (even for 4-bit,
+// multiple of 4 for 2-bit; 8-bit rows are always byte aligned).
+//
+
+typedef
+void
+(MLASCALL MLAS_GATHER_BLOCK_DEQUANTIZE_SYM_KERNEL)(
+    float* Output,
+    const uint8_t* PackedRow,
+    const float* Scales,
+    const uint8_t* PackedZeroPoints,
+    size_t ZeroPointBase,
+    size_t K,
+    size_t BlockSize);
+
+typedef
+void
+(MLASCALL MLAS_GATHER_BLOCK_DEQUANTIZE_SYM_FP16_KERNEL)(
+    uint16_t* Output,
+    const uint8_t* PackedRow,
+    const float* Scales,
+    const uint8_t* PackedZeroPoints,
+    size_t ZeroPointBase,
+    size_t K,
+    size_t BlockSize);
+
+typedef
+void
+(MLASCALL MLAS_GATHER_BLOCK_DEQUANTIZE_ASYM_KERNEL)(
+    float* Output,
+    const uint8_t* PackedRow,
+    const float* Scales,
+    const uint8_t* PackedZeroPoints,
+    size_t ZeroPointBase,
+    int32_t DefaultZeroPoint,
+    size_t QuantBits,
+    size_t K,
+    size_t BlockSize);
+
+typedef
+void
+(MLASCALL MLAS_GATHER_BLOCK_DEQUANTIZE_ASYM_FP16_KERNEL)(
+    uint16_t* Output,
+    const uint8_t* PackedRow,
+    const float* Scales,
+    const uint8_t* PackedZeroPoints,
+    size_t ZeroPointBase,
+    int32_t DefaultZeroPoint,
+    size_t QuantBits,
+    size_t K,
+    size_t BlockSize);
+
 template<typename InputType, typename FilterType>
 struct MLAS_QUANT_KERNEL
 {
@@ -1402,11 +1466,21 @@ extern "C" {
     MLAS_QUANTIZE_LINEAR_S4_KERNEL MlasQuantizeLinearS4Kernel;
     MLAS_QUANTIZE_LINEAR_U4_KERNEL MlasQuantizeLinearU4Kernel;
     MLAS_DEQUANTIZE_BLOCKWISE_2BITS_KERNEL MlasDequantizeBlockwise2BitsKernel;
+    MLAS_GATHER_BLOCK_DEQUANTIZE_SYM_KERNEL MlasGatherBlockDequantizeSymKernel;
+    MLAS_GATHER_BLOCK_DEQUANTIZE_SYM_FP16_KERNEL MlasGatherBlockDequantizeSymFp16Kernel;
+    MLAS_GATHER_BLOCK_DEQUANTIZE_ASYM_KERNEL MlasGatherBlockDequantizeAsymKernel;
+    MLAS_GATHER_BLOCK_DEQUANTIZE_ASYM_FP16_KERNEL MlasGatherBlockDequantizeAsymFp16Kernel;
 
 #if defined(MLAS_TARGET_AMD64)
     MLAS_DEQUANTIZE_LINEAR_S8_KERNEL MlasDequantizeLinearS8Kernel;
     MLAS_DEQUANTIZE_LINEAR_U8_KERNEL MlasDequantizeLinearU8Kernel;
     MLAS_DEQUANTIZE_BLOCKWISE_2BITS_KERNEL MlasDequantizeBlockwise2BitsKernelAvx2;
+    MLAS_GATHER_BLOCK_DEQUANTIZE_SYM_KERNEL MlasGatherBlockDequantizeSymKernelAvx2;
+    MLAS_GATHER_BLOCK_DEQUANTIZE_SYM_FP16_KERNEL MlasGatherBlockDequantizeSymFp16KernelAvx2;
+    MLAS_GATHER_BLOCK_DEQUANTIZE_ASYM_KERNEL MlasGatherBlockDequantizeAsymKernelAvx2;
+    MLAS_GATHER_BLOCK_DEQUANTIZE_ASYM_FP16_KERNEL MlasGatherBlockDequantizeAsymFp16KernelAvx2;
+    MLAS_GATHER_BLOCK_DEQUANTIZE_SYM_KERNEL MlasGatherBlockDequantizeSymKernelAvx512F;
+    MLAS_GATHER_BLOCK_DEQUANTIZE_ASYM_KERNEL MlasGatherBlockDequantizeAsymKernelAvx512F;
     MLAS_COMPUTE_UNARY_FLOAT_KERNEL MlasErfKernelFma3;
     MLAS_COMPUTE_UNARY_FLOAT_KERNEL MlasComputeExpF32KernelFma3;
     MLAS_COMPUTE_UNARY_FLOAT_KERNEL MlasComputeExpF32KernelAvx512F;
@@ -1927,6 +2001,10 @@ MLAS_COMPUTE_TANH_FP16_KERNEL* TanhFP16KernelRoutine = nullptr;
     MLAS_DEQUANTIZE_LINEAR_S8_KERNEL* DequantizeLinearS8Kernel;
     MLAS_DEQUANTIZE_LINEAR_U8_KERNEL* DequantizeLinearU8Kernel;
     MLAS_DEQUANTIZE_BLOCKWISE_2BITS_KERNEL* DequantizeBlockwise2BitsKernel;
+    MLAS_GATHER_BLOCK_DEQUANTIZE_SYM_KERNEL* GatherBlockDequantizeSymKernel;
+    MLAS_GATHER_BLOCK_DEQUANTIZE_SYM_FP16_KERNEL* GatherBlockDequantizeSymFp16Kernel;
+    MLAS_GATHER_BLOCK_DEQUANTIZE_ASYM_KERNEL* GatherBlockDequantizeAsymKernel;
+    MLAS_GATHER_BLOCK_DEQUANTIZE_ASYM_FP16_KERNEL* GatherBlockDequantizeAsymFp16Kernel;
     uint32_t NchwcBlockSize;
     uint32_t PreferredBufferAlignment;
     int32_t MaximumThreadCount;

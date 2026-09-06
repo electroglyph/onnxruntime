@@ -445,6 +445,10 @@ Return Value:
     this->DequantizeLinearS8Kernel = MlasDequantizeLinearS8Kernel;
     this->DequantizeLinearU8Kernel = MlasDequantizeLinearU8Kernel;
     this->DequantizeBlockwise2BitsKernel = MlasDequantizeBlockwise2BitsKernel;
+    this->GatherBlockDequantizeSymKernel = MlasGatherBlockDequantizeSymKernel;
+    this->GatherBlockDequantizeSymFp16Kernel = MlasGatherBlockDequantizeSymFp16Kernel;
+    this->GatherBlockDequantizeAsymKernel = MlasGatherBlockDequantizeAsymKernel;
+    this->GatherBlockDequantizeAsymFp16Kernel = MlasGatherBlockDequantizeAsymFp16Kernel;
 #ifndef __APPLE__
 #ifndef FORCE_GENERIC_ALGORITHMS
     this->CastF16ToF32Kernel = &MlasCastF16ToF32KernelSse;
@@ -543,6 +547,10 @@ Return Value:
                 this->GemmU8U8Kernel = MlasGemmU8U8KernelAvx2;
                 this->ConvSymU8S8Dispatch = &MlasConvSymDispatchAvx2;
                 this->DequantizeBlockwise2BitsKernel = MlasDequantizeBlockwise2BitsKernelAvx2;
+                this->GatherBlockDequantizeSymKernel = MlasGatherBlockDequantizeSymKernelAvx2;
+                this->GatherBlockDequantizeSymFp16Kernel = MlasGatherBlockDequantizeSymFp16KernelAvx2;
+                this->GatherBlockDequantizeAsymKernel = MlasGatherBlockDequantizeAsymKernelAvx2;
+                this->GatherBlockDequantizeAsymFp16Kernel = MlasGatherBlockDequantizeAsymFp16KernelAvx2;
 
                 this->GemmFloatKernel = MlasGemmFloatKernelFma3;
                 this->GemmDoubleKernel = MlasGemmDoubleKernelFma3;
@@ -625,6 +633,12 @@ Return Value:
                     this->LinearAttentionDispatch = &MlasLinearAttentionDispatchAvx512F;
                     this->QuantizeLinearS8Kernel = MlasQuantizeLinearS8KernelAvx512F;
                     this->QuantizeLinearU8Kernel = MlasQuantizeLinearU8KernelAvx512F;
+                    // The AVX512F gather tier is FP32-output only; FP16 rows
+                    // stay on the AVX2 tier (no F16C requirement here).
+                    this->GatherBlockDequantizeSymKernel =
+                        MlasGatherBlockDequantizeSymKernelAvx512F;
+                    this->GatherBlockDequantizeAsymKernel =
+                        MlasGatherBlockDequantizeAsymKernelAvx512F;
                     this->NchwcBlockSize = 16;
                     this->PreferredBufferAlignment = 64;
 

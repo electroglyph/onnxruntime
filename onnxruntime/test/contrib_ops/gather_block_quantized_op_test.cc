@@ -1227,5 +1227,140 @@ TEST(GatherBlockQuantizedOpTest, GatherAxisNoPadingUInt8) {
 }
 #endif
 
+// Fast-path (rank 2, gather_axis == 0, quantize_axis == 1) regression tests.
+// These pin the scalar index simplification that SIMD kernels must preserve:
+// deterministic unpacked tables, expected outputs from an independent
+// row/block scalar loop in stored-domain math ((q+off)-(zp+off))*scale.
+template <typename T1, typename T2, typename Tind>
+void RunFastPathCase(int64_t N, int64_t K, int64_t block_size, int64_t bits,
+                     const std::vector<int>& indices, bool with_zp) {
+  // Storage offset applied by the packing helpers (cancels against zp).
+  const int off = std::is_same_v<T1, uint8_t> ? (1 << (bits - 1))
+                                              : (std::is_same_v<T1, UInt4x2> ? 8 : 0);
+  const int kernel_default_zp = std::is_same_v<T1, uint8_t> ? (1 << (bits - 1)) : 0;
+  const int span = bits == 8 ? 256 : (bits == 2 ? 4 : 16);
+  const int lo = bits == 8 ? -128 : -(span / 2);
+
+  std::vector<int> data(static_cast<size_t>(N * K));
+  for (int64_t r = 0; r < N; ++r) {
+    for (int64_t j = 0; j < K; ++j) {
+      data[static_cast<size_t>(r * K + j)] = lo + static_cast<int>((r * 131 + j * 17 + 7) % span);
+    }
+  }
+  const int64_t num_blocks = (K + block_size - 1) / block_size;
+  std::vector<float> scales(static_cast<size_t>(N * num_blocks));
+  for (int64_t r = 0; r < N; ++r) {
+    for (int64_t b = 0; b < num_blocks; ++b) {
+      float s = 0.5f + 0.25f * static_cast<float>((r + b) % 5);
+      scales[static_cast<size_t>(r * num_blocks + b)] = ((r + b) % 7 == 6) ? -s : s;
+    }
+  }
+  std::vector<int> zero_points;
+  if (with_zp) {
+    zero_points.resize(static_cast<size_t>(N * num_blocks));
+    for (int64_t r = 0; r < N; ++r) {
+      for (int64_t b = 0; b < num_blocks; ++b) {
+        zero_points[static_cast<size_t>(r * num_blocks + b)] =
+            lo + static_cast<int>((r * 29 + b * 13 + 3) % span);
+      }
+    }
+  }
+
+  // Independent oracle: row/block loops, direct scale index, stored-domain math.
+  const int64_t gather_N = static_cast<int64_t>(indices.size());
+  std::vector<float> output(static_cast<size_t>(gather_N * K));
+  for (int64_t t = 0; t < gather_N; ++t) {
+    int64_t row = indices[static_cast<size_t>(t)] < 0 ? indices[static_cast<size_t>(t)] + N
+                                                      : indices[static_cast<size_t>(t)];
+    for (int64_t j = 0; j < K; ++j) {
+      const int64_t b = j / block_size;
+      const int sq = data[static_cast<size_t>(row * K + j)] + off;
+      const int sz = with_zp ? zero_points[static_cast<size_t>(row * num_blocks + b)] + off
+                             : kernel_default_zp;
+      output[static_cast<size_t>(t * K + j)] =
+          static_cast<float>(sq - sz) * scales[static_cast<size_t>(row * num_blocks + b)];
+    }
+  }
+
+  RunUnpackedData<T1, T2, Tind>(
+      data, {N, K}, indices, {gather_N}, scales, {N, num_blocks}, zero_points,
+      /*gather_axis=*/0, /*quantize_axis=*/1, block_size, bits, output, {gather_N, K},
+      /*expect_success=*/true);
+}
+
+TEST(GatherBlockQuantizedOpTest, FastPath_Int4_Sym_K768) {
+  // Q4_0 embedding shape: duplicates + negative index hit the dedup cache.
+  RunFastPathCase<Int4x2, float, int32_t>(2, 768, 32, 4, {1, 0, 1, -1}, false);
+  RunFastPathCase<Int4x2, float, int64_t>(2, 768, 32, 4, {1, 0, 1, -1}, false);
+}
+
+TEST(GatherBlockQuantizedOpTest, FastPath_Int4_ExplicitZp) {
+  RunFastPathCase<Int4x2, float, int32_t>(2, 64, 32, 4, {0, 1}, true);
+  RunFastPathCase<Int4x2, MLFloat16, int64_t>(2, 64, 32, 4, {1}, true);
+}
+
+TEST(GatherBlockQuantizedOpTest, FastPath_UInt4_K768) {
+  RunFastPathCase<UInt4x2, float, int32_t>(2, 768, 32, 4, {0, 1}, true);
+  RunFastPathCase<UInt4x2, float, int64_t>(2, 768, 32, 4, {1, 1, 0}, true);
+}
+
+TEST(GatherBlockQuantizedOpTest, FastPath_UInt4_DefaultZp) {
+  RunFastPathCase<UInt4x2, float, int32_t>(2, 64, 32, 4, {1}, false);
+}
+
+TEST(GatherBlockQuantizedOpTest, FastPath_UInt8_Bits4_K768) {
+  RunFastPathCase<uint8_t, float, int32_t>(2, 768, 32, 4, {1, 0}, true);
+  RunFastPathCase<uint8_t, float, int64_t>(2, 768, 32, 4, {0}, false);
+}
+
+TEST(GatherBlockQuantizedOpTest, FastPath_UInt8_Bits2) {
+  RunFastPathCase<uint8_t, float, int32_t>(2, 64, 16, 2, {1, 0}, true);
+  RunFastPathCase<uint8_t, float, int32_t>(2, 32, 16, 2, {0}, false);
+}
+
+TEST(GatherBlockQuantizedOpTest, FastPath_UInt8_Bits2_K768) {
+  RunFastPathCase<uint8_t, float, int32_t>(2, 768, 32, 2, {1, 0}, true);
+  RunFastPathCase<uint8_t, MLFloat16, int64_t>(2, 768, 32, 2, {0}, false);
+  RunFastPathCase<uint8_t, float, int32_t>(2, 100, 32, 2, {1}, true);  // K tail
+}
+
+TEST(GatherBlockQuantizedOpTest, FastPath_UInt8_Bits8) {
+  RunFastPathCase<uint8_t, float, int32_t>(2, 64, 16, 8, {1}, true);
+  RunFastPathCase<uint8_t, float, int64_t>(2, 64, 32, 8, {0, 1}, false);
+}
+
+TEST(GatherBlockQuantizedOpTest, FastPath_UInt8_Bits8_K768) {
+  RunFastPathCase<uint8_t, float, int32_t>(2, 768, 32, 8, {1, 0}, true);
+  RunFastPathCase<uint8_t, MLFloat16, int64_t>(2, 768, 32, 8, {0}, false);
+  RunFastPathCase<uint8_t, float, int32_t>(2, 33, 16, 8, {1}, true);  // odd K still uses MLAS
+}
+
+TEST(GatherBlockQuantizedOpTest, FastPath_KTails) {
+  RunFastPathCase<Int4x2, float, int32_t>(2, 100, 32, 4, {1, 0}, false);
+  RunFastPathCase<Int4x2, float, int32_t>(2, 33, 16, 4, {0}, false);
+  RunFastPathCase<uint8_t, float, int32_t>(2, 100, 32, 4, {1}, true);
+}
+
+TEST(GatherBlockQuantizedOpTest, FastPath_BlockSizes) {
+  RunFastPathCase<Int4x2, float, int32_t>(2, 128, 64, 4, {1}, false);
+  RunFastPathCase<Int4x2, float, int32_t>(2, 128, 128, 4, {0, 1}, false);
+  RunFastPathCase<Int4x2, float, int32_t>(2, 32, 128, 4, {1}, false);  // block > K
+  RunFastPathCase<Int4x2, float, int32_t>(2, 64, 16, 4, {0}, false);
+}
+
+TEST(GatherBlockQuantizedOpTest, FastPath_MLFloat16Out) {
+  RunFastPathCase<Int4x2, MLFloat16, int32_t>(2, 64, 32, 4, {1}, false);
+  RunFastPathCase<uint8_t, MLFloat16, int64_t>(2, 32, 16, 4, {0, 1}, true);
+}
+
+TEST(GatherBlockQuantizedOpTest, FastPath_LargeGatherN) {
+  // 64 lookups over 2 rows exercises TryParallelFor batching.
+  std::vector<int> indices(64);
+  for (size_t i = 0; i < indices.size(); ++i) {
+    indices[i] = static_cast<int>(i % 2);
+  }
+  RunFastPathCase<Int4x2, float, int32_t>(2, 768, 32, 4, indices, false);
+}
+
 }  // namespace test
 }  // namespace onnxruntime

@@ -204,6 +204,28 @@ if (onnxruntime_CROSS_COMPILING)
   endif()
 endif()
 
+# GCC 13+ emits stringop-overflow/maybe-uninitialized/array-bounds false
+# positives on several pre-existing TUs (optimizer, tests). Keep those
+# families as warnings so -Werror builds stay green without touching
+# unrelated sources.
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
+  check_cxx_compiler_flag(-Wno-error=stringop-overflow HAS_WNO_ERROR_STRINGOP_OVERFLOW)
+  if (HAS_WNO_ERROR_STRINGOP_OVERFLOW)
+    string(APPEND CMAKE_CXX_FLAGS " -Wno-error=stringop-overflow")
+    string(APPEND CMAKE_C_FLAGS " -Wno-error=stringop-overflow")
+  endif()
+  check_cxx_compiler_flag(-Wno-error=maybe-uninitialized HAS_WNO_ERROR_MAYBE_UNINITIALIZED)
+  if (HAS_WNO_ERROR_MAYBE_UNINITIALIZED)
+    string(APPEND CMAKE_CXX_FLAGS " -Wno-error=maybe-uninitialized")
+    string(APPEND CMAKE_C_FLAGS " -Wno-error=maybe-uninitialized")
+  endif()
+  check_cxx_compiler_flag(-Wno-error=array-bounds HAS_WNO_ERROR_ARRAY_BOUNDS)
+  if (HAS_WNO_ERROR_ARRAY_BOUNDS)
+    string(APPEND CMAKE_CXX_FLAGS " -Wno-error=array-bounds")
+    string(APPEND CMAKE_C_FLAGS " -Wno-error=array-bounds")
+  endif()
+endif()
+
 # Mark symbols to be invisible, for macOS/iOS/visionOS/tvOS target only
 # Due to many dependencies have different symbol visibility settings, set global compile flags here.
 if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin|iOS|visionOS|tvOS")
