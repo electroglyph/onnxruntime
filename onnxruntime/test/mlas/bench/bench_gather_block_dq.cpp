@@ -40,6 +40,8 @@ static void BM_GatherBlockDequantizeRow(benchmark::State& state) {
       return;
     }
     if (bits != 4 && bits != 8) {
+      // No AVX512F vector path for 2-bit rows (they delegate to the AVX2
+      // entry): tier 3 would duplicate tier 2 exactly, so skip it.
       state.SkipWithError("AVX512F core is 4/8-bit only (2-bit delegates to AVX2)");
       return;
     }

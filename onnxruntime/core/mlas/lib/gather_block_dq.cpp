@@ -23,9 +23,9 @@ Abstract:
     default (0 for Sym; caller-picked DefaultZeroPoint for Asym). The op
     only routes packed-unit-aligned rows here (even K for 4-bit, K a
     multiple of 4 for 2-bit; 8-bit rows are always byte aligned) and uses
-    the generic op loop otherwise. 2-bit values pack four per byte (element 0 in the low
-    2 bits) with the zero points packed the same way; 8-bit values and
-    zero points are plain bytes.
+    the generic op loop otherwise. 2-bit values pack four per byte
+    (element 0 in the low 2 bits) with the zero points packed the same way;
+    8-bit values and zero points are plain bytes.
 
 --*/
 
