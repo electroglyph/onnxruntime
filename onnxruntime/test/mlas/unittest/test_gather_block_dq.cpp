@@ -13,7 +13,8 @@ Abstract:
     Unit tests for the MLAS gather + block-dequantize fast-path entries:
     randomized tables vs an independent scalar oracle, bitwise float /
     1-ULP fp16. Dispatch entries run everywhere; per-ISA Avx2 entries are
-    gated on the platform flag.
+    gated on the platform flag and Avx512F entries on the dispatch slot
+    resolving to the AVX512F kernel (same gate idiom as MlasErfTest).
 
 --*/
 
@@ -128,7 +129,7 @@ RunGatherBlockDqCase(bool sym, bool fp16, bool with_zp, size_t k, size_t block_s
   }
   const uint8_t* zp_ptr = with_zp ? packed_zp.data() : nullptr;
   // Null zp means the packing default: 0 for Sym, caller-picked for Asym
-  // (8 for uint8, 0 for packed UInt4x2 without a zp tensor).
+  // (1 << (bits-1) for uint8: 2/8/128; 0 for packed UInt4x2).
   const int32_t zp_fallback = sym ? 0 : default_zp;
 
   std::vector<float> expected(k);
@@ -218,28 +219,30 @@ RunGatherBlockDqCase(bool sym, bool fp16, bool with_zp, size_t k, size_t block_s
 void
 RunGatherBlockDqMatrix(bool use_avx2_entry, bool use_avx512f_entry = false) {
   // (sym, fp16, with_zp, K, block, zp_base, seed, ..., default_zp, bits)
-  RunGatherBlockDqCase(true, false, false, 32, 32, 0, 1, use_avx2_entry, use_avx512f_entry);
-  RunGatherBlockDqCase(true, false, false, 768, 32, 0, 2, use_avx2_entry, use_avx512f_entry);
-  RunGatherBlockDqCase(true, false, true, 768, 32, 0, 3, use_avx2_entry, use_avx512f_entry);
-  RunGatherBlockDqCase(true, false, true, 128, 32, 5, 4, use_avx2_entry, use_avx512f_entry);  // odd zp base
-  RunGatherBlockDqCase(false, false, true, 768, 32, 0, 5, use_avx2_entry, use_avx512f_entry);
-  RunGatherBlockDqCase(false, false, false, 768, 32, 0, 6, use_avx2_entry, use_avx512f_entry);
+  // The trailing default_zp/bits are spelled out (not defaulted) so the
+  // use_avx512f_entry flag binds to its own parameter.
+  RunGatherBlockDqCase(true, false, false, 32, 32, 0, 1, use_avx2_entry, 8, 4, use_avx512f_entry);
+  RunGatherBlockDqCase(true, false, false, 768, 32, 0, 2, use_avx2_entry, 8, 4, use_avx512f_entry);
+  RunGatherBlockDqCase(true, false, true, 768, 32, 0, 3, use_avx2_entry, 8, 4, use_avx512f_entry);
+  RunGatherBlockDqCase(true, false, true, 128, 32, 5, 4, use_avx2_entry, 8, 4, use_avx512f_entry);  // odd zp base
+  RunGatherBlockDqCase(false, false, true, 768, 32, 0, 5, use_avx2_entry, 8, 4, use_avx512f_entry);
+  RunGatherBlockDqCase(false, false, false, 768, 32, 0, 6, use_avx2_entry, 8, 4, use_avx512f_entry);
   // Null zp with default 0: packed UInt4x2 without a zp tensor.
   RunGatherBlockDqCase(false, false, false, 768, 32, 0, 19, use_avx2_entry, 0, 4, use_avx512f_entry);
   RunGatherBlockDqCase(false, false, false, 64, 32, 0, 20, use_avx2_entry, 0, 4, use_avx512f_entry);
   RunGatherBlockDqCase(false, true, false, 64, 32, 0, 21, use_avx2_entry, 0, 4, use_avx512f_entry);
-  RunGatherBlockDqCase(true, false, false, 100, 32, 0, 7, use_avx2_entry, use_avx512f_entry);  // K tail
-  RunGatherBlockDqCase(true, false, false, 33, 16, 0, 8, use_avx2_entry, use_avx512f_entry);   // odd K
-  RunGatherBlockDqCase(true, false, false, 0, 32, 0, 9, use_avx2_entry, use_avx512f_entry);    // empty row
-  RunGatherBlockDqCase(true, false, false, 128, 64, 0, 10, use_avx2_entry, use_avx512f_entry);
-  RunGatherBlockDqCase(true, false, false, 128, 128, 0, 11, use_avx2_entry, use_avx512f_entry);
-  RunGatherBlockDqCase(true, false, false, 32, 128, 0, 12, use_avx2_entry, use_avx512f_entry);  // block > K
-  RunGatherBlockDqCase(true, false, false, 64, 16, 0, 13, use_avx2_entry, use_avx512f_entry);
-  RunGatherBlockDqCase(false, false, true, 256, 64, 3, 14, use_avx2_entry, use_avx512f_entry);
-  RunGatherBlockDqCase(true, true, false, 64, 32, 0, 15, use_avx2_entry, use_avx512f_entry);
-  RunGatherBlockDqCase(true, true, true, 128, 32, 1, 16, use_avx2_entry, use_avx512f_entry);
-  RunGatherBlockDqCase(false, true, true, 256, 32, 0, 17, use_avx2_entry, use_avx512f_entry);
-  RunGatherBlockDqCase(false, true, false, 33, 16, 0, 18, use_avx2_entry, use_avx512f_entry);
+  RunGatherBlockDqCase(true, false, false, 100, 32, 0, 7, use_avx2_entry, 8, 4, use_avx512f_entry);  // K tail
+  RunGatherBlockDqCase(true, false, false, 33, 16, 0, 8, use_avx2_entry, 8, 4, use_avx512f_entry);   // odd K
+  RunGatherBlockDqCase(true, false, false, 0, 32, 0, 9, use_avx2_entry, 8, 4, use_avx512f_entry);    // empty row
+  RunGatherBlockDqCase(true, false, false, 128, 64, 0, 10, use_avx2_entry, 8, 4, use_avx512f_entry);
+  RunGatherBlockDqCase(true, false, false, 128, 128, 0, 11, use_avx2_entry, 8, 4, use_avx512f_entry);
+  RunGatherBlockDqCase(true, false, false, 32, 128, 0, 12, use_avx2_entry, 8, 4, use_avx512f_entry);  // block > K
+  RunGatherBlockDqCase(true, false, false, 64, 16, 0, 13, use_avx2_entry, 8, 4, use_avx512f_entry);
+  RunGatherBlockDqCase(false, false, true, 256, 64, 3, 14, use_avx2_entry, 8, 4, use_avx512f_entry);
+  RunGatherBlockDqCase(true, true, false, 64, 32, 0, 15, use_avx2_entry, 8, 4, use_avx512f_entry);
+  RunGatherBlockDqCase(true, true, true, 128, 32, 1, 16, use_avx2_entry, 8, 4, use_avx512f_entry);
+  RunGatherBlockDqCase(false, true, true, 256, 32, 0, 17, use_avx2_entry, 8, 4, use_avx512f_entry);
+  RunGatherBlockDqCase(false, true, false, 33, 16, 0, 18, use_avx2_entry, 8, 4, use_avx512f_entry);
   // 2-bit Asym (uint8 defaults to zp 2): K must be a multiple of 4.
   RunGatherBlockDqCase(false, false, false, 768, 32, 0, 22, use_avx2_entry, 2, 2, use_avx512f_entry);
   RunGatherBlockDqCase(false, false, true, 768, 32, 0, 23, use_avx2_entry, 2, 2, use_avx512f_entry);

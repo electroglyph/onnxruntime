@@ -12,8 +12,11 @@ Abstract:
 
     This module implements the AVX2 kernels for the gather +
     block-dequantize fast path: one trailing-dim row slice of K quantized
-    elements (Sym: 4-bit, K even; Asym: QuantBits 2/4/8, rows packed-unit
-    aligned) in blocks of BlockSize. Layout and zero-point rules match the
+    elements (Sym: 4-bit; Asym: QuantBits 2/4/8) in blocks of BlockSize.
+    The op routes packed-unit-aligned rows (even K for 4-bit, K a multiple
+    of 4 for 2-bit); the vector chunks additionally need a positive even
+    BlockSize for 4-bit and a positive multiple of 4 for 2-bit (any positive
+    value works for 8-bit). Layout and zero-point rules match the
     scalar baseline in gather_block_dq.cpp; the byte interleave happens
     BEFORE widening (dword interleave after widening would cross 128-bit
     lanes).
@@ -193,7 +196,9 @@ DequantChunk16(const uint8_t* packed, __m256 scale, __m256i zp, float* out) {
   _mm256_storeu_ps(out + 8, _mm256_mul_ps(f1, scale));
 }
 
-// Scalar tail for remainders below the vector widths.
+// Scalar tail for remainders below the vector widths. The packed base
+// advances with j, which keeps the block start's alignment, so the
+// relative sub-byte indexing below matches the chunk paths.
 template <bool Sym, int Bits>
 inline void
 DequantChunkScalar(const uint8_t* packed, float scale, int32_t zp, float* out, size_t count) {

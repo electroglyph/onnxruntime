@@ -11,32 +11,39 @@ Module Name:
 Abstract:
 
     This module implements the AVX512F kernels for the gather +
-    block-dequantize fast path: one trailing-dim row slice of K 4-bit
-    elements (K even) in blocks of BlockSize. Layout and zero-point rules
+    block-dequantize fast path: one trailing-dim row slice of K 4-bit or
+    8-bit elements in blocks of BlockSize. Layout and zero-point rules
     match the scalar baseline in gather_block_dq.cpp. Only FP32-output
     entries live here; FP16 rows stay on the AVX2 tier (dispatch never
-    selects this TU for FP16). Asym entries take QuantBits but only
-    accelerate 4-bit here; other widths delegate to the AVX2 entry
-    (strictly faster than scalar, and AVX512F implies AVX2).
+    selects this TU for FP16). Asym entries take QuantBits: 4-bit rows use
+    the LUT core and 8-bit rows the arithmetic core below; 2-bit rows
+    delegate to the AVX2 entry (5-17x faster than scalar across blocks
+    16-128 in the in-tree row benchmark, and AVX512F implies AVX2).
+    BlockSize must be a positive multiple of 16 (the
+    16-element shots assume block-aligned shots); the op enforces a power
+    of 2 >= 16.
 
     Compute core (AVX512F only, no BW/VL): one 64-element iteration =
-    32 packed bytes. The zmm load splits into two 128-bit halves; each half
-    reuses the SSE2-class nibble split + byte interleave, giving 16 ordered
-    nibbles per shot. Dequant is a per-block 16-entry float LUT built in the
+    32 packed bytes fetched with two 128-bit loads (a full 64-byte zmm
+    load would over-read the row on the last step). Each half reuses the
+    SSE2-class nibble split + byte interleave, giving 16 ordered nibbles
+    per shot. Dequant is a per-block 16-entry float LUT built in the
     int domain (lane i holds sext4(i)-zp exactly, then one int->float
     convert and one scale multiply), indexed by zero-extended nibbles via
     _mm512_permutexvar_ps: no per-element sign extension, no per-element
-    int->float converts, no per-element subtract/multiply. A standalone
-    benchmark (K=768) picked the LUT over the arithmetic halves-kernel:
-    1.15-1.63x faster symmetric, 1.02-1.27x asymmetric at block >= 32,
-    parity at asymmetric block 16. Remainders below 64 elements go through
-    a scalar tail.
+    int->float converts, no per-element subtract/multiply. The in-tree row
+    benchmark (K=768, BM_GatherBlockDequantizeRow) shows the LUT core ahead
+    of the AVX2 path by 1.7-2.7x symmetric and 1.6-2.4x asymmetric across
+    blocks 16-128, with and without an explicit zero-point tensor.
+    Remainders below 64 elements go through a scalar tail.
 
     8-bit rows use a separate arithmetic core (plain byte loads, widen +
-    subtract + convert + multiply per 16-elem shot, same block counter);
-    a 256-entry LUT is not worth its build cost at one byte per element. A
-    second head-to-head picked it over the AVX2 8-bit path 1.4-2.0x at
-    block <= 32, parity at block >= 64, so block >= 128 delegates to AVX2.
+    subtract + convert + multiply per 16-elem shot, same block counter):
+    a 256-entry table would cost 16 zmm loads per block before any compute,
+    against 4 ALU ops per shot here. The in-tree row benchmark (K=768) has
+    the core ahead of the AVX2 8-bit path by 1.3-1.8x at block <= 32 and
+    ~1.2x at block 64, reaching parity at block 128 — so block >= 128
+    delegates to AVX2.
 
 --*/
 
@@ -49,7 +56,7 @@ Abstract:
 
 namespace {
 
-// Constant lane ids 15..0 and symmetric sign-extended nibble values: lane i
+// Constant lane ids 0..15 and symmetric sign-extended nibble values: lane i
 // holds sext4(i) exactly in the int domain.
 alignas(64) const int32_t LaneIds[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
 alignas(64) const int32_t SymSext[16] = {0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1};
@@ -74,10 +81,12 @@ UnpackZpNibble(const uint8_t* packed_zp, size_t base, size_t b, int32_t fallback
 
 // Unpacks 32 packed bytes into four shots of 16 ordered nibble values
 // (shots cover elems 0..15, 16..31, 32..47, 48..63 of the 64-element step).
+// Two 128-bit loads read exactly the 32 bytes the step consumes; a full
+// 64-byte zmm load would over-read the row on the last step.
 inline void
 Unpack64(const uint8_t* packed, __m128i shots[4]) {
-  const __m512i v = _mm512_loadu_si512(static_cast<const void*>(packed));
-  const __m128i halves[2] = {_mm512_castsi512_si128(v), _mm512_extracti32x4_epi32(v, 1)};
+  const __m128i halves[2] = {_mm_loadu_si128(reinterpret_cast<const __m128i*>(packed)),
+                             _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed + 16))};
   const __m128i lowmask = _mm_set1_epi8(0x0F);
   for (int h = 0; h < 2; ++h) {
     const __m128i lo = _mm_and_si128(halves[h], lowmask);
@@ -146,8 +155,8 @@ DequantizeRowFloat(const uint8_t* packed_row, const float* scales, const uint8_t
 // 8-bit float-output row kernel: values and zero points are plain bytes
 // (one zero point per block, DefaultZeroPoint when packed_zp is null).
 // 64-element steps from one zmm load, four 16-elem widen shots across the
-// 128-bit lanes, per-block scale/zp via the shot counter. Asym-only: 8-bit
-// is the only width the op supports besides 4-bit sub-byte packing.
+// 128-bit lanes, per-block scale/zp via the shot counter. Asym-only: Sym
+// entries are 4-bit only, so no Sym instantiation exists.
 void
 DequantizeRowFloatBits8(const uint8_t* packed_row, const float* scales, const uint8_t* packed_zp,
                         size_t zp_base, size_t k, size_t block_size, float* out,

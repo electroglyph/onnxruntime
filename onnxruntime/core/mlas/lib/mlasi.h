@@ -874,12 +874,19 @@ void
 // entries take QuantBits (2, 4, or 8 for uint8; 4 for packed UInt4x2):
 // PackedRow holds ceil(K*QuantBits/8) bytes with element 0 of each byte in
 // the low bits, and PackedZeroPoints (nullable) holds one QuantBits-wide
-// value per block (nibble-packed for 2/4-bit, one byte per block for 8-bit)
-// starting at element ZeroPointBase. Scales holds ceil(K/BlockSize) scales
-// for the row. When PackedZeroPoints is null, DefaultZeroPoint is used (0
-// for Sym; caller-picked for Asym: 1 << (QuantBits-1) for uint8, 0 for
-// packed UInt4x2). K must keep rows packed-unit aligned (even for 4-bit,
-// multiple of 4 for 2-bit; 8-bit rows are always byte aligned).
+// value per block (sub-byte packed like the data: nibbles for 4-bit,
+// 2-bit quads for 2-bit; one byte per block for 8-bit) starting at element
+// ZeroPointBase. Scales holds ceil(K/BlockSize) scales for the row. When
+// PackedZeroPoints is null, DefaultZeroPoint is used (0 for Sym;
+// caller-picked for Asym: 1 << (QuantBits-1) for uint8, 0 for packed
+// UInt4x2). PackedRow must hold ceil(K*QuantBits/8) bytes; any K >= 0 is
+// correct (scalar tails cover remainders), but vector chunks engage only on
+// aligned runs, so BlockSize must be a positive even number for 4-bit, a
+// positive multiple of 4 for 2-bit, and a positive multiple of 16 for the
+// AVX512F kernels (their 16-element shots assume block-aligned shots); 8-bit scalar/AVX2 take any positive
+// BlockSize. The op additionally gates K to packed-unit multiples (even for
+// 4-bit, multiple of 4 for 2-bit) so its row-byte math is exact, and
+// enforces a power of 2 >= 16 for BlockSize, which satisfies all tiers.
 //
 
 typedef

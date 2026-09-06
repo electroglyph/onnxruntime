@@ -14,15 +14,18 @@ Abstract:
     block-dequantize fast path: one trailing-dim row slice of K quantized
     elements in blocks of BlockSize. Sym entries are 4-bit only (see the
     nibble layout below); Asym entries take QuantBits (2, 4, or 8). See the
-    matching vector kernels in intrinsics/avx2/gather_block_dq_avx2.cpp.
+    matching vector kernels in intrinsics/avx2/gather_block_dq_avx2.cpp
+    and intrinsics/avx512/gather_block_dq_avx512f.cpp.
 
     Nibble layout (both 4-bit packings): the even element lives in the low
     nibble. Zero points are one nibble per block starting at nibble
     ZeroPointBase (flat packed index); a null pointer means the packing
-    default (0 for Sym, 8 for Asym). K must be even so rows are byte
-    aligned; the caller falls back to scalar code otherwise. 2-bit values
-    pack four per byte (element 0 in the low 2 bits) with the zero points
-    packed the same way; 8-bit values and zero points are plain bytes.
+    default (0 for Sym; caller-picked DefaultZeroPoint for Asym). The op
+    only routes packed-unit-aligned rows here (even K for 4-bit, K a
+    multiple of 4 for 2-bit; 8-bit rows are always byte aligned) and uses
+    the generic op loop otherwise. 2-bit values pack four per byte (element 0 in the low
+    2 bits) with the zero points packed the same way; 8-bit values and
+    zero points are plain bytes.
 
 --*/
 
