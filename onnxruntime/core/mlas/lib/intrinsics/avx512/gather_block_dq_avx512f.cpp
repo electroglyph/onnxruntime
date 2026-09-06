@@ -32,6 +32,12 @@ Abstract:
     parity at asymmetric block 16. Remainders below 64 elements go through
     a scalar tail.
 
+    8-bit rows use a separate arithmetic core (plain byte loads, widen +
+    subtract + convert + multiply per 16-elem shot, same block counter);
+    a 256-entry LUT is not worth its build cost at one byte per element. A
+    second head-to-head picked it over the AVX2 8-bit path 1.4-2.0x at
+    block <= 32, parity at block >= 64, so block >= 128 delegates to AVX2.
+
 --*/
 
 #include "../../mlasi.h"
@@ -137,6 +143,48 @@ DequantizeRowFloat(const uint8_t* packed_row, const float* scales, const uint8_t
   DequantTail<Sym>(packed_row, scales, packed_zp, zp_base, j, k, block_size, zp_fallback, out);
 }
 
+// 8-bit float-output row kernel: values and zero points are plain bytes
+// (one zero point per block, DefaultZeroPoint when packed_zp is null).
+// 64-element steps from one zmm load, four 16-elem widen shots across the
+// 128-bit lanes, per-block scale/zp via the shot counter. Asym-only: 8-bit
+// is the only width the op supports besides 4-bit sub-byte packing.
+void
+DequantizeRowFloatBits8(const uint8_t* packed_row, const float* scales, const uint8_t* packed_zp,
+                        size_t zp_base, size_t k, size_t block_size, float* out,
+                        int32_t zp_fallback) {
+  const size_t shots_per_block = block_size >> 4;
+  size_t b = 0;
+  size_t shot_in_block = shots_per_block;  // force load on first shot
+  __m512 scale_vec = _mm512_setzero_ps();
+  __m512i zp_vec = _mm512_setzero_si512();
+  size_t j = 0;
+  for (; j + 64 <= k; j += 64) {
+    const __m512i v = _mm512_loadu_si512(static_cast<const void*>(packed_row + j));
+    const __m128i lanes[4] = {_mm512_castsi512_si128(v), _mm512_extracti32x4_epi32(v, 1),
+                              _mm512_extracti32x4_epi32(v, 2), _mm512_extracti32x4_epi32(v, 3)};
+    for (int s = 0; s < 4; ++s) {
+      if (shot_in_block == shots_per_block) {
+        shot_in_block = 0;
+        scale_vec = _mm512_set1_ps(scales[b]);
+        const int32_t zp =
+            packed_zp == nullptr ? zp_fallback : static_cast<int32_t>(packed_zp[zp_base + b]);
+        zp_vec = _mm512_set1_epi32(zp);
+        ++b;
+      }
+      ++shot_in_block;
+      const __m512i q = _mm512_cvtepu8_epi32(lanes[s]);
+      const __m512 f = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(q, zp_vec)), scale_vec);
+      _mm512_storeu_ps(out + j + static_cast<size_t>(16 * s), f);
+    }
+  }
+  for (; j < k; ++j) {
+    const size_t bb = j / block_size;
+    const int32_t zp =
+        packed_zp == nullptr ? zp_fallback : static_cast<int32_t>(packed_zp[zp_base + bb]);
+    out[j] = static_cast<float>(static_cast<int32_t>(packed_row[j]) - zp) * scales[bb];
+  }
+}
+
 }  // namespace
 
 void
@@ -165,8 +213,21 @@ MlasGatherBlockDequantizeAsymKernelAvx512F(
     size_t QuantBits,
     size_t K,
     size_t BlockSize) {
+  if (QuantBits == 8) {
+    // 8-bit arithmetic core, except at block >= 128 where it ties the AVX2
+    // entry within noise — delegate there so no cell regresses.
+    if (BlockSize >= 128) {
+      MlasGatherBlockDequantizeAsymKernelAvx2(Output, PackedRow, Scales, PackedZeroPoints,
+                                              ZeroPointBase, DefaultZeroPoint, QuantBits, K,
+                                              BlockSize);
+      return;
+    }
+    DequantizeRowFloatBits8(PackedRow, Scales, PackedZeroPoints, ZeroPointBase, K, BlockSize,
+                            Output, DefaultZeroPoint);
+    return;
+  }
   if (QuantBits != 4) {
-    // Only 4-bit rows use the AVX512F core; other widths delegate to the
+    // Only 4-bit rows use the AVX512F LUT core; 2-bit rows delegate to the
     // AVX2 entry (same library, bit-identical by construction).
     MlasGatherBlockDequantizeAsymKernelAvx2(Output, PackedRow, Scales, PackedZeroPoints,
                                             ZeroPointBase, DefaultZeroPoint, QuantBits, K,

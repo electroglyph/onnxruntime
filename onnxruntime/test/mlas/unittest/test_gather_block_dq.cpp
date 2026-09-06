@@ -255,6 +255,7 @@ RunGatherBlockDqMatrix(bool use_avx2_entry, bool use_avx512f_entry = false) {
   RunGatherBlockDqCase(false, false, true, 33, 16, 0, 32, use_avx2_entry, 128, 8, use_avx512f_entry);   // odd K
   RunGatherBlockDqCase(false, false, false, 0, 32, 0, 33, use_avx2_entry, 128, 8, use_avx512f_entry);   // empty row
   RunGatherBlockDqCase(false, false, false, 128, 64, 0, 34, use_avx2_entry, 128, 8, use_avx512f_entry);
+  RunGatherBlockDqCase(false, false, true, 256, 128, 0, 37, use_avx2_entry, 128, 8, use_avx512f_entry);  // blk128: AVX512F delegates to AVX2
   RunGatherBlockDqCase(false, true, true, 64, 32, 0, 35, use_avx2_entry, 128, 8, use_avx512f_entry);
   RunGatherBlockDqCase(false, true, false, 33, 16, 0, 36, use_avx2_entry, 128, 8, use_avx512f_entry);  // odd K
 }

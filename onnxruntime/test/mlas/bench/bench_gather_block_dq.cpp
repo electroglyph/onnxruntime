@@ -39,8 +39,8 @@ static void BM_GatherBlockDequantizeRow(benchmark::State& state) {
       state.SkipWithError("AVX512F dispatch not selected on this host");
       return;
     }
-    if (bits != 4) {
-      state.SkipWithError("AVX512F core is 4-bit only (other widths delegate to AVX2)");
+    if (bits != 4 && bits != 8) {
+      state.SkipWithError("AVX512F core is 4/8-bit only (2-bit delegates to AVX2)");
       return;
     }
     if (fp16) {
@@ -159,7 +159,7 @@ BENCHMARK(BM_GatherBlockDequantizeRow)
         {0, 1, 2, 3},  // tier
         {0, 1},        // sym
         {0, 1},        // fp16 out
-        {2, 4, 8},     // bits
-        {16, 32, 64},  // block size
-        {0, 1},        // explicit zp
+        {2, 4, 8},      // bits
+        {16, 32, 64, 128},  // block size
+        {0, 1},         // explicit zp
     });
