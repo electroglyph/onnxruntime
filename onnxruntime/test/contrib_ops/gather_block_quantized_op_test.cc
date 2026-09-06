@@ -1322,6 +1322,7 @@ TEST(GatherBlockQuantizedOpTest, FastPath_UInt8_Bits2_K768) {
   RunFastPathCase<uint8_t, float, int32_t>(2, 768, 32, 2, {1, 0}, true);
   RunFastPathCase<uint8_t, MLFloat16, int64_t>(2, 768, 32, 2, {0}, false);
   RunFastPathCase<uint8_t, float, int32_t>(2, 100, 32, 2, {1}, true);  // K tail
+  RunFastPathCase<uint8_t, MLFloat16, int32_t>(2, 64, 32, 2, {1}, true);
 }
 
 TEST(GatherBlockQuantizedOpTest, FastPath_UInt8_Bits8) {
@@ -1333,6 +1334,7 @@ TEST(GatherBlockQuantizedOpTest, FastPath_UInt8_Bits8_K768) {
   RunFastPathCase<uint8_t, float, int32_t>(2, 768, 32, 8, {1, 0}, true);
   RunFastPathCase<uint8_t, MLFloat16, int64_t>(2, 768, 32, 8, {0}, false);
   RunFastPathCase<uint8_t, float, int32_t>(2, 33, 16, 8, {1}, true);  // odd K still uses MLAS
+  RunFastPathCase<uint8_t, MLFloat16, int32_t>(2, 64, 32, 8, {1, 0}, true);
 }
 
 TEST(GatherBlockQuantizedOpTest, FastPath_KTails) {
@@ -1346,11 +1348,15 @@ TEST(GatherBlockQuantizedOpTest, FastPath_BlockSizes) {
   RunFastPathCase<Int4x2, float, int32_t>(2, 128, 128, 4, {0, 1}, false);
   RunFastPathCase<Int4x2, float, int32_t>(2, 32, 128, 4, {1}, false);  // block > K
   RunFastPathCase<Int4x2, float, int32_t>(2, 64, 16, 4, {0}, false);
+  RunFastPathCase<Int4x2, float, int32_t>(2, 1088, 256, 4, {1, 0}, false);  // spb=16 LUT cadence
 }
 
 TEST(GatherBlockQuantizedOpTest, FastPath_MLFloat16Out) {
   RunFastPathCase<Int4x2, MLFloat16, int32_t>(2, 64, 32, 4, {1}, false);
   RunFastPathCase<uint8_t, MLFloat16, int64_t>(2, 32, 16, 4, {0, 1}, true);
+  RunFastPathCase<UInt4x2, MLFloat16, int32_t>(2, 64, 32, 4, {1}, false);
+  RunFastPathCase<UInt4x2, MLFloat16, int64_t>(2, 64, 32, 4, {0, 1}, true);
+  RunFastPathCase<uint8_t, MLFloat16, int64_t>(2, 32, 16, 4, {0, 1}, false);
 }
 
 TEST(GatherBlockQuantizedOpTest, FastPath_LargeGatherN) {

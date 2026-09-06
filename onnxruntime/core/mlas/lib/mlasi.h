@@ -869,8 +869,9 @@ void
 //
 // Gather+block-dequantize fast path: dequantize one-trailing-dim row slice
 // of K quantized elements in blocks of BlockSize. Sym entries are 4-bit
-// only (Int4x2): PackedRow holds K/2 bytes with the even element in the low
-// nibble, and PackedZeroPoints (nullable) holds one nibble per block. Asym
+// only (Int4x2): PackedRow holds K/2 bytes (K even, see the op gate below)
+// with the even element in the low nibble, and PackedZeroPoints (nullable)
+// holds one nibble per block. Asym
 // entries take QuantBits (2, 4, or 8 for uint8; 4 for packed UInt4x2):
 // PackedRow holds ceil(K*QuantBits/8) bytes with element 0 of each byte in
 // the low bits, and PackedZeroPoints (nullable) holds one QuantBits-wide

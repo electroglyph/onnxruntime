@@ -466,7 +466,9 @@ Status GatherBlockQuantized<T1, Tind>::CopyDataAndDequantizeFastPath(const T1* d
   const int64_t num_blocks = (gather_block + block_size_ - 1) / block_size_;
   // MLAS handles 8-bit rows at any K, 4-bit rows with even K, and 2-bit
   // rows with K a multiple of 4 (packed-unit alignment); other shapes use
-  // the scalar loop below.
+  // the scalar loop below. For uint8, K always satisfies this by shape math
+  // (gather_block = packed dim x components), so the fallback is reachable
+  // via packed T1 with odd K.
   const bool use_mlas =
       (bits_ == 8) || (((gather_block & 1) == 0) && (bits_ == 4 || ((gather_block & 3) == 0)));
 

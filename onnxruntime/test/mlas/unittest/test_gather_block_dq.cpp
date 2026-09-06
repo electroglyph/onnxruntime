@@ -261,6 +261,19 @@ RunGatherBlockDqMatrix(bool use_avx2_entry, bool use_avx512f_entry = false) {
   RunGatherBlockDqCase(false, false, true, 256, 128, 0, 37, use_avx2_entry, 128, 8, use_avx512f_entry);  // blk128: AVX512F delegates to AVX2
   RunGatherBlockDqCase(false, true, true, 64, 32, 0, 35, use_avx2_entry, 128, 8, use_avx512f_entry);
   RunGatherBlockDqCase(false, true, false, 33, 16, 0, 36, use_avx2_entry, 128, 8, use_avx512f_entry);  // odd K
+  // LUT-rebuild extremes for Asym-4: spb=1 at block 16, spb=8 at block 128.
+  RunGatherBlockDqCase(false, false, true, 256, 16, 0, 38, use_avx2_entry, 8, 4, use_avx512f_entry);
+  RunGatherBlockDqCase(false, false, true, 256, 128, 2, 39, use_avx2_entry, 8, 4, use_avx512f_entry);
+  // 8-bit vector core at block 16 (spb=1); 2-bit delegation at block 128.
+  RunGatherBlockDqCase(false, false, true, 256, 16, 0, 40, use_avx2_entry, 128, 8, use_avx512f_entry);
+  RunGatherBlockDqCase(false, false, true, 256, 128, 0, 41, use_avx2_entry, 2, 2, use_avx512f_entry);
+  // Block 256 (spb=16 LUT cadence with 1088 = 17*64 steps; 8-bit delegates).
+  RunGatherBlockDqCase(true, false, false, 1088, 256, 0, 42, use_avx2_entry, 8, 4, use_avx512f_entry);
+  RunGatherBlockDqCase(false, false, false, 1088, 256, 0, 43, use_avx2_entry, 8, 4, use_avx512f_entry);
+  RunGatherBlockDqCase(false, false, true, 256, 256, 0, 44, use_avx2_entry, 128, 8, use_avx512f_entry);
+  // Empty rows for the remaining Asym widths.
+  RunGatherBlockDqCase(false, false, false, 0, 32, 0, 45, use_avx2_entry, 8, 4, use_avx512f_entry);
+  RunGatherBlockDqCase(false, false, false, 0, 32, 0, 46, use_avx2_entry, 2, 2, use_avx512f_entry);
 }
 
 }  // namespace
